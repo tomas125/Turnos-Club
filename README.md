@@ -6,7 +6,7 @@ Aplicacion web para reservar turnos de 2 canchas de futbol.
 
 - Frontend: HTML, CSS, JavaScript (sin frameworks)
 - Backend: Node.js + Express
-- Almacenamiento: archivo local `reservas.json`
+- Almacenamiento: SQLite (`reservas.sqlite`)
 - Subida de comprobantes: `multer` en carpeta `uploads`
 
 ## Estructura
@@ -14,8 +14,7 @@ Aplicacion web para reservar turnos de 2 canchas de futbol.
 - `public/` -> frontend
 - `server/` -> backend Express
 - `uploads/` -> comprobantes subidos
-- `reservas.json` -> reservas guardadas
-- `bloqueos.json` -> bloqueos administrativos
+- `reservas.sqlite` -> base SQLite de reservas y bloqueos
 
 ## Instalacion
 
@@ -29,6 +28,7 @@ Aplicacion web para reservar turnos de 2 canchas de futbol.
 
    ```env
    PORT=3000
+   SQLITE_PATH=
    WHATSAPP_NUMERO=54911XXXXXXXX
    TRANSFER_ALIAS=tu.alias.real
    TRANSFER_CBU=tu.cbu.real
@@ -86,4 +86,5 @@ Devuelve configuracion basica (horarios, transferencia, numero WhatsApp).
 - Al reservar, se genera enlace `wa.me` con el mensaje prearmado y se redirige automaticamente.
 - El comprobante se guarda en el servidor, pero no puede adjuntarse automaticamente a WhatsApp Web.
 - `WHATSAPP_NUMERO` debe ir en formato internacional sin `+`, espacios ni guiones.
+- Si no defines `SQLITE_PATH`, la app usa `reservas.sqlite` en la carpeta del proyecto (en Vercel queda en `/tmp`).
 - Si un usuario quiere cancelar, lo solicita por WhatsApp y el admin decide la cancelacion desde el panel.

@@ -2,3 +2,6 @@ node_modules/
 .env
 uploads/*
 !uploads/.gitkeep
+reservas.sqlite
+reservas.sqlite-shm
+reservas.sqlite-wal

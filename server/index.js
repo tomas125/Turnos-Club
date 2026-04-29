@@ -3,16 +3,17 @@ require("dotenv").config();
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
-const fs = require("fs/promises");
 const fsSync = require("fs");
 const crypto = require("crypto");
+const sqlite3 = require("sqlite3").verbose();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ROOT_DIR = path.resolve(__dirname, "..");
-const RESERVAS_FILE = path.join(ROOT_DIR, "reservas.json");
-const BLOQUEOS_FILE = path.join(ROOT_DIR, "bloqueos.json");
-const UPLOADS_DIR = path.join(ROOT_DIR, "uploads");
+const IS_VERCEL = process.env.VERCEL === "1";
+const DATA_DIR = IS_VERCEL ? path.join("/tmp", "reservas-turno-data") : ROOT_DIR;
+const DB_FILE = process.env.SQLITE_PATH || path.join(DATA_DIR, "reservas.sqlite");
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 
 const CANCHAS = [1, 2];
 const HORA_INICIO = 10;
@@ -23,12 +24,74 @@ const TRANSFER_TITULAR = process.env.TRANSFER_TITULAR || "Club CMR Futbol";
 const WHATSAPP_NUMERO =
   (process.env.WHATSAPP_NUMERO || "5491112345678").replace(/\D/g, "");
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD;
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const adminSessions = new Map();
 
+if (!fsSync.existsSync(DATA_DIR)) {
+  fsSync.mkdirSync(DATA_DIR, { recursive: true });
+}
 if (!fsSync.existsSync(UPLOADS_DIR)) {
   fsSync.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
+
+const db = new sqlite3.Database(DB_FILE);
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(error) {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(this);
+    });
+  });
+}
+
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(rows);
+    });
+  });
+}
+
+async function initDb() {
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS reservas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nombre TEXT NOT NULL,
+      telefono TEXT NOT NULL,
+      cancha INTEGER NOT NULL,
+      fecha TEXT NOT NULL,
+      horario TEXT NOT NULL,
+      comprobante_nombre_original TEXT NOT NULL,
+      comprobante_archivo TEXT NOT NULL,
+      comprobante_mimetype TEXT NOT NULL,
+      comprobante_size INTEGER NOT NULL,
+      creado_en TEXT NOT NULL
+    )
+  `);
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS bloqueos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cancha INTEGER NOT NULL,
+      fecha TEXT NOT NULL,
+      horario TEXT,
+      horario_desde TEXT,
+      horario_hasta TEXT,
+      dia_completo INTEGER NOT NULL,
+      motivo TEXT NOT NULL,
+      creado_en TEXT NOT NULL
+    )
+  `);
+}
+
+const dbReady = initDb();
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
@@ -64,6 +127,14 @@ const upload = multer({
 app.use(express.json());
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use(express.static(path.join(ROOT_DIR, "public")));
+app.use(async (_req, _res, next) => {
+  try {
+    await dbReady;
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 function toHorario(hora) {
   return `${String(hora).padStart(2, "0")}:00`;
@@ -106,34 +177,74 @@ function generarHorarios() {
   return horarios;
 }
 
-async function readReservas() {
-  return readJsonArrayFile(RESERVAS_FILE);
+function mapReservaRow(row) {
+  return {
+    id: row.id,
+    nombre: row.nombre,
+    telefono: row.telefono,
+    cancha: row.cancha,
+    fecha: row.fecha,
+    horario: row.horario,
+    comprobante: {
+      nombreOriginal: row.comprobante_nombre_original,
+      archivo: row.comprobante_archivo,
+      mimetype: row.comprobante_mimetype,
+      size: row.comprobante_size,
+    },
+    creadoEn: row.creado_en,
+  };
 }
 
-async function readBloqueos() {
-  return readJsonArrayFile(BLOQUEOS_FILE);
+function mapBloqueoRow(row) {
+  return {
+    id: row.id,
+    cancha: row.cancha,
+    fecha: row.fecha,
+    horario: row.horario,
+    horarioDesde: row.horario_desde,
+    horarioHasta: row.horario_hasta,
+    diaCompleto: Boolean(row.dia_completo),
+    motivo: row.motivo,
+    creadoEn: row.creado_en,
+  };
 }
 
-async function readJsonArrayFile(filePath) {
-  try {
-    const raw = await fs.readFile(filePath, "utf-8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      await fs.writeFile(filePath, "[]", "utf-8");
-      return [];
-    }
-    throw error;
+async function readReservas({ fecha = "", cancha = null } = {}) {
+  const where = [];
+  const params = [];
+  if (fecha) {
+    where.push("fecha = ?");
+    params.push(fecha);
   }
+  if (cancha) {
+    where.push("cancha = ?");
+    params.push(cancha);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const rows = await dbAll(
+    `SELECT * FROM reservas ${whereSql} ORDER BY fecha ASC, horario ASC, id DESC`,
+    params
+  );
+  return rows.map(mapReservaRow);
 }
 
-async function writeReservas(reservas) {
-  await fs.writeFile(RESERVAS_FILE, JSON.stringify(reservas, null, 2), "utf-8");
-}
-
-async function writeBloqueos(bloqueos) {
-  await fs.writeFile(BLOQUEOS_FILE, JSON.stringify(bloqueos, null, 2), "utf-8");
+async function readBloqueos({ fecha = "", cancha = null } = {}) {
+  const where = [];
+  const params = [];
+  if (fecha) {
+    where.push("fecha = ?");
+    params.push(fecha);
+  }
+  if (cancha) {
+    where.push("cancha = ?");
+    params.push(cancha);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const rows = await dbAll(
+    `SELECT * FROM bloqueos ${whereSql} ORDER BY fecha ASC, id DESC`,
+    params
+  );
+  return rows.map(mapBloqueoRow);
 }
 
 function isReservaBloqueada(bloqueos, cancha, fecha, horario) {
@@ -154,21 +265,25 @@ function isReservaBloqueada(bloqueos, cancha, fecha, horario) {
 }
 
 function createAdminSession() {
-  const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
-  adminSessions.set(token, expiresAt);
-  return token;
+  const payload = String(expiresAt);
+  const signature = crypto
+    .createHmac("sha256", ADMIN_SESSION_SECRET)
+    .update(payload)
+    .digest("hex");
+  return `${payload}.${signature}`;
 }
 
 function isValidAdminToken(token) {
   if (!token) return false;
-  const expiresAt = adminSessions.get(token);
-  if (!expiresAt) return false;
-  if (Date.now() > expiresAt) {
-    adminSessions.delete(token);
-    return false;
-  }
-  return true;
+  const [payload, providedSignature] = String(token).split(".");
+  if (!payload || !providedSignature) return false;
+  const expectedSignature = crypto
+    .createHmac("sha256", ADMIN_SESSION_SECRET)
+    .update(payload)
+    .digest("hex");
+  if (providedSignature !== expectedSignature) return false;
+  return Date.now() <= Number(payload);
 }
 
 function requireAdmin(req, res, next) {
@@ -231,15 +346,8 @@ app.get("/api/reservas", async (req, res, next) => {
   try {
     const fecha = (req.query.fecha || "").trim();
     const cancha = req.query.cancha ? Number(req.query.cancha) : null;
-    const reservas = await readReservas();
-
-    const filtered = reservas.filter((r) => {
-      const fechaOk = fecha ? r.fecha === fecha : true;
-      const canchaOk = cancha ? r.cancha === cancha : true;
-      return fechaOk && canchaOk;
-    });
-
-    res.json(filtered);
+    const reservas = await readReservas({ fecha, cancha });
+    res.json(reservas);
   } catch (error) {
     next(error);
   }
@@ -249,13 +357,8 @@ app.get("/api/bloqueos", async (req, res, next) => {
   try {
     const fecha = (req.query.fecha || "").trim();
     const cancha = req.query.cancha ? Number(req.query.cancha) : null;
-    const bloqueos = await readBloqueos();
-    const filtered = bloqueos.filter((b) => {
-      const fechaOk = fecha ? b.fecha === fecha : true;
-      const canchaOk = cancha ? b.cancha === cancha : true;
-      return fechaOk && canchaOk;
-    });
-    res.json(filtered);
+    const bloqueos = await readBloqueos({ fecha, cancha });
+    res.json(bloqueos);
   } catch (error) {
     next(error);
   }
@@ -296,8 +399,30 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
         .json({ error: "Ese horario esta bloqueado por administracion." });
     }
 
+    const creadoEn = new Date().toISOString();
+
+    const comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+
+    const insertResult = await dbRun(
+      `INSERT INTO reservas
+      (nombre, telefono, cancha, fecha, horario, comprobante_nombre_original, comprobante_archivo, comprobante_mimetype, comprobante_size, creado_en)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        nombre,
+        telefono,
+        cancha,
+        fecha,
+        horario,
+        req.file.originalname,
+        req.file.filename,
+        req.file.mimetype,
+        req.file.size,
+        creadoEn,
+      ]
+    );
+
     const reserva = {
-      id: Date.now(),
+      id: insertResult.lastID,
       nombre,
       telefono,
       cancha,
@@ -309,13 +434,8 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
         mimetype: req.file.mimetype,
         size: req.file.size,
       },
-      creadoEn: new Date().toISOString(),
+      creadoEn,
     };
-
-    const comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-
-    reservas.push(reserva);
-    await writeReservas(reservas);
 
     return res.status(201).json({
       ...reserva,
@@ -343,12 +463,11 @@ app.delete("/api/admin/reservas/:id", requireAdmin, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const reservas = await readReservas();
-    const index = reservas.findIndex((r) => Number(r.id) === id);
-    if (index === -1) {
+    const eliminada = reservas.find((r) => Number(r.id) === id);
+    if (!eliminada) {
       return res.status(404).json({ error: "Reserva no encontrada." });
     }
-    const [eliminada] = reservas.splice(index, 1);
-    await writeReservas(reservas);
+    await dbRun("DELETE FROM reservas WHERE id = ?", [id]);
     return res.json({ ok: true, reserva: eliminada });
   } catch (error) {
     next(error);
@@ -411,8 +530,25 @@ app.post("/api/admin/bloqueos", requireAdmin, async (req, res, next) => {
       return res.status(409).json({ error: "Ese bloqueo se superpone con otro ya existente." });
     }
 
+    const creadoEn = new Date().toISOString();
+    const insertResult = await dbRun(
+      `INSERT INTO bloqueos
+      (cancha, fecha, horario, horario_desde, horario_hasta, dia_completo, motivo, creado_en)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        cancha,
+        fecha,
+        nuevoBloqueo.horario,
+        nuevoBloqueo.horarioDesde,
+        nuevoBloqueo.horarioHasta,
+        diaCompleto ? 1 : 0,
+        motivo,
+        creadoEn,
+      ]
+    );
+
     const bloqueo = {
-      id: Date.now(),
+      id: insertResult.lastID,
       cancha,
       fecha,
       horario: nuevoBloqueo.horario,
@@ -420,11 +556,8 @@ app.post("/api/admin/bloqueos", requireAdmin, async (req, res, next) => {
       horarioHasta: nuevoBloqueo.horarioHasta,
       diaCompleto,
       motivo,
-      creadoEn: new Date().toISOString(),
+      creadoEn,
     };
-
-    bloqueos.push(bloqueo);
-    await writeBloqueos(bloqueos);
     return res.status(201).json(bloqueo);
   } catch (error) {
     next(error);
@@ -435,12 +568,11 @@ app.delete("/api/admin/bloqueos/:id", requireAdmin, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const bloqueos = await readBloqueos();
-    const index = bloqueos.findIndex((b) => Number(b.id) === id);
-    if (index === -1) {
+    const eliminado = bloqueos.find((b) => Number(b.id) === id);
+    if (!eliminado) {
       return res.status(404).json({ error: "Bloqueo no encontrado." });
     }
-    const [eliminado] = bloqueos.splice(index, 1);
-    await writeBloqueos(bloqueos);
+    await dbRun("DELETE FROM bloqueos WHERE id = ?", [id]);
     return res.json({ ok: true, bloqueo: eliminado });
   } catch (error) {
     next(error);
@@ -462,6 +594,10 @@ app.use((err, _req, res, _next) => {
   return res.status(500).json({ error: "Error interno del servidor." });
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor iniciado en http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Servidor iniciado en http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
