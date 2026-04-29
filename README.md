@@ -87,5 +87,6 @@ Devuelve configuracion basica (horarios, transferencia, numero WhatsApp).
 - El comprobante se guarda en el servidor, pero no puede adjuntarse automaticamente a WhatsApp Web.
 - `WHATSAPP_NUMERO` debe ir en formato internacional sin `+`, espacios ni guiones.
 - Si no defines `SQLITE_PATH`, la app usa `reservas.sqlite` en la carpeta del proyecto (en Vercel queda en `/tmp`).
+- En Vercel, para persistencia real entre invocaciones, configura `KV_REST_API_URL` y `KV_REST_API_TOKEN` (Redis/Upstash desde Integrations).
 - Si el runtime no puede cargar SQLite nativo (caso serverless), la app hace fallback automatico a JSON en `/tmp` para no caerse.
 - Si un usuario quiere cancelar, lo solicita por WhatsApp y el admin decide la cancelacion desde el panel.

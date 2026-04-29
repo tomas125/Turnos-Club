@@ -6,6 +6,12 @@ const path = require("path");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const crypto = require("crypto");
+let kv = null;
+try {
+  ({ kv } = require("@vercel/kv"));
+} catch (_error) {
+  kv = null;
+}
 let sqlite3 = null;
 try {
   sqlite3 = require("sqlite3").verbose();
@@ -34,6 +40,12 @@ const WHATSAPP_NUMERO =
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
 const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD;
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const USE_KV =
+  Boolean(kv) &&
+  Boolean(process.env.KV_REST_API_URL) &&
+  Boolean(process.env.KV_REST_API_TOKEN);
+const KV_RESERVAS_KEY = "reservas";
+const KV_BLOQUEOS_KEY = "bloqueos";
 
 if (!fsSync.existsSync(DATA_DIR)) {
   fsSync.mkdirSync(DATA_DIR, { recursive: true });
@@ -237,7 +249,24 @@ async function writeJsonArrayFile(filePath, data) {
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
 }
 
+async function readKvArray(key) {
+  const data = await kv.get(key);
+  return Array.isArray(data) ? data : [];
+}
+
+async function writeKvArray(key, data) {
+  await kv.set(key, data);
+}
+
 async function readReservas({ fecha = "", cancha = null } = {}) {
+  if (USE_KV) {
+    const reservas = await readKvArray(KV_RESERVAS_KEY);
+    return reservas.filter((r) => {
+      const fechaOk = fecha ? r.fecha === fecha : true;
+      const canchaOk = cancha ? Number(r.cancha) === Number(cancha) : true;
+      return fechaOk && canchaOk;
+    });
+  }
   if (!USE_SQLITE) {
     const reservas = await readJsonArrayFile(RESERVAS_FILE);
     return reservas.filter((r) => {
@@ -265,6 +294,16 @@ async function readReservas({ fecha = "", cancha = null } = {}) {
 }
 
 async function readBloqueos({ fecha = "", cancha = null } = {}) {
+  if (USE_KV) {
+    const bloqueos = await readKvArray(KV_BLOQUEOS_KEY);
+    return bloqueos
+      .map((b) => ({ ...b, diaCompleto: Boolean(b.diaCompleto) }))
+      .filter((b) => {
+        const fechaOk = fecha ? b.fecha === fecha : true;
+        const canchaOk = cancha ? Number(b.cancha) === Number(cancha) : true;
+        return fechaOk && canchaOk;
+      });
+  }
   if (!USE_SQLITE) {
     const bloqueos = await readJsonArrayFile(BLOQUEOS_FILE);
     return bloqueos
@@ -450,7 +489,27 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
     const comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
 
     let reservaId = Date.now();
-    if (USE_SQLITE) {
+    if (USE_KV) {
+      const reservasAll = await readKvArray(KV_RESERVAS_KEY);
+      reservaId =
+        reservasAll.reduce((max, r) => Math.max(max, Number(r.id) || 0), 0) + 1;
+      reservasAll.push({
+        id: reservaId,
+        nombre,
+        telefono,
+        cancha,
+        fecha,
+        horario,
+        comprobante: {
+          nombreOriginal: req.file.originalname,
+          archivo: req.file.filename,
+          mimetype: req.file.mimetype,
+          size: req.file.size,
+        },
+        creadoEn,
+      });
+      await writeKvArray(KV_RESERVAS_KEY, reservasAll);
+    } else if (USE_SQLITE) {
       const insertResult = await dbRun(
         `INSERT INTO reservas
         (nombre, telefono, cancha, fecha, horario, comprobante_nombre_original, comprobante_archivo, comprobante_mimetype, comprobante_size, creado_en)
@@ -537,7 +596,11 @@ app.delete("/api/admin/reservas/:id", requireAdmin, async (req, res, next) => {
     if (!eliminada) {
       return res.status(404).json({ error: "Reserva no encontrada." });
     }
-    if (USE_SQLITE) {
+    if (USE_KV) {
+      const reservasAll = await readKvArray(KV_RESERVAS_KEY);
+      const restantes = reservasAll.filter((r) => Number(r.id) !== id);
+      await writeKvArray(KV_RESERVAS_KEY, restantes);
+    } else if (USE_SQLITE) {
       await dbRun("DELETE FROM reservas WHERE id = ?", [id]);
     } else {
       const reservasAll = await readJsonArrayFile(RESERVAS_FILE);
@@ -608,7 +671,23 @@ app.post("/api/admin/bloqueos", requireAdmin, async (req, res, next) => {
 
     const creadoEn = new Date().toISOString();
     let bloqueoId = Date.now();
-    if (USE_SQLITE) {
+    if (USE_KV) {
+      const bloqueosAll = await readKvArray(KV_BLOQUEOS_KEY);
+      bloqueoId =
+        bloqueosAll.reduce((max, b) => Math.max(max, Number(b.id) || 0), 0) + 1;
+      bloqueosAll.push({
+        id: bloqueoId,
+        cancha,
+        fecha,
+        horario: nuevoBloqueo.horario,
+        horarioDesde: nuevoBloqueo.horarioDesde,
+        horarioHasta: nuevoBloqueo.horarioHasta,
+        diaCompleto,
+        motivo,
+        creadoEn,
+      });
+      await writeKvArray(KV_BLOQUEOS_KEY, bloqueosAll);
+    } else if (USE_SQLITE) {
       const insertResult = await dbRun(
         `INSERT INTO bloqueos
         (cancha, fecha, horario, horario_desde, horario_hasta, dia_completo, motivo, creado_en)
@@ -668,7 +747,11 @@ app.delete("/api/admin/bloqueos/:id", requireAdmin, async (req, res, next) => {
     if (!eliminado) {
       return res.status(404).json({ error: "Bloqueo no encontrado." });
     }
-    if (USE_SQLITE) {
+    if (USE_KV) {
+      const bloqueosAll = await readKvArray(KV_BLOQUEOS_KEY);
+      const restantes = bloqueosAll.filter((b) => Number(b.id) !== id);
+      await writeKvArray(KV_BLOQUEOS_KEY, restantes);
+    } else if (USE_SQLITE) {
       await dbRun("DELETE FROM bloqueos WHERE id = ?", [id]);
     } else {
       const bloqueosAll = await readJsonArrayFile(BLOQUEOS_FILE);
