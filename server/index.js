@@ -3,9 +3,15 @@ require("dotenv").config();
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
+const fs = require("fs/promises");
 const fsSync = require("fs");
 const crypto = require("crypto");
-const sqlite3 = require("sqlite3").verbose();
+let sqlite3 = null;
+try {
+  sqlite3 = require("sqlite3").verbose();
+} catch (_error) {
+  sqlite3 = null;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,6 +19,8 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const IS_VERCEL = process.env.VERCEL === "1";
 const DATA_DIR = IS_VERCEL ? path.join("/tmp", "reservas-turno-data") : ROOT_DIR;
 const DB_FILE = process.env.SQLITE_PATH || path.join(DATA_DIR, "reservas.sqlite");
+const RESERVAS_FILE = path.join(DATA_DIR, "reservas.json");
+const BLOQUEOS_FILE = path.join(DATA_DIR, "bloqueos.json");
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 
 const CANCHAS = [1, 2];
@@ -34,7 +42,8 @@ if (!fsSync.existsSync(UPLOADS_DIR)) {
   fsSync.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-const db = new sqlite3.Database(DB_FILE);
+const USE_SQLITE = Boolean(sqlite3);
+const db = USE_SQLITE ? new sqlite3.Database(DB_FILE) : null;
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -61,6 +70,7 @@ function dbAll(sql, params = []) {
 }
 
 async function initDb() {
+  if (!USE_SQLITE) return;
   await dbRun(`
     CREATE TABLE IF NOT EXISTS reservas (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,7 +219,33 @@ function mapBloqueoRow(row) {
   };
 }
 
+async function readJsonArrayFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf-8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      await fs.writeFile(filePath, "[]", "utf-8");
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function writeJsonArrayFile(filePath, data) {
+  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
+}
+
 async function readReservas({ fecha = "", cancha = null } = {}) {
+  if (!USE_SQLITE) {
+    const reservas = await readJsonArrayFile(RESERVAS_FILE);
+    return reservas.filter((r) => {
+      const fechaOk = fecha ? r.fecha === fecha : true;
+      const canchaOk = cancha ? Number(r.cancha) === Number(cancha) : true;
+      return fechaOk && canchaOk;
+    });
+  }
   const where = [];
   const params = [];
   if (fecha) {
@@ -229,6 +265,16 @@ async function readReservas({ fecha = "", cancha = null } = {}) {
 }
 
 async function readBloqueos({ fecha = "", cancha = null } = {}) {
+  if (!USE_SQLITE) {
+    const bloqueos = await readJsonArrayFile(BLOQUEOS_FILE);
+    return bloqueos
+      .map((b) => ({ ...b, diaCompleto: Boolean(b.diaCompleto) }))
+      .filter((b) => {
+        const fechaOk = fecha ? b.fecha === fecha : true;
+        const canchaOk = cancha ? Number(b.cancha) === Number(cancha) : true;
+        return fechaOk && canchaOk;
+      });
+  }
   const where = [];
   const params = [];
   if (fecha) {
@@ -403,26 +449,50 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
 
     const comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
 
-    const insertResult = await dbRun(
-      `INSERT INTO reservas
-      (nombre, telefono, cancha, fecha, horario, comprobante_nombre_original, comprobante_archivo, comprobante_mimetype, comprobante_size, creado_en)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
+    let reservaId = Date.now();
+    if (USE_SQLITE) {
+      const insertResult = await dbRun(
+        `INSERT INTO reservas
+        (nombre, telefono, cancha, fecha, horario, comprobante_nombre_original, comprobante_archivo, comprobante_mimetype, comprobante_size, creado_en)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          nombre,
+          telefono,
+          cancha,
+          fecha,
+          horario,
+          req.file.originalname,
+          req.file.filename,
+          req.file.mimetype,
+          req.file.size,
+          creadoEn,
+        ]
+      );
+      reservaId = insertResult.lastID;
+    } else {
+      const reservasAll = await readJsonArrayFile(RESERVAS_FILE);
+      reservaId =
+        reservasAll.reduce((max, r) => Math.max(max, Number(r.id) || 0), 0) + 1;
+      reservasAll.push({
+        id: reservaId,
         nombre,
         telefono,
         cancha,
         fecha,
         horario,
-        req.file.originalname,
-        req.file.filename,
-        req.file.mimetype,
-        req.file.size,
+        comprobante: {
+          nombreOriginal: req.file.originalname,
+          archivo: req.file.filename,
+          mimetype: req.file.mimetype,
+          size: req.file.size,
+        },
         creadoEn,
-      ]
-    );
+      });
+      await writeJsonArrayFile(RESERVAS_FILE, reservasAll);
+    }
 
     const reserva = {
-      id: insertResult.lastID,
+      id: reservaId,
       nombre,
       telefono,
       cancha,
@@ -467,7 +537,13 @@ app.delete("/api/admin/reservas/:id", requireAdmin, async (req, res, next) => {
     if (!eliminada) {
       return res.status(404).json({ error: "Reserva no encontrada." });
     }
-    await dbRun("DELETE FROM reservas WHERE id = ?", [id]);
+    if (USE_SQLITE) {
+      await dbRun("DELETE FROM reservas WHERE id = ?", [id]);
+    } else {
+      const reservasAll = await readJsonArrayFile(RESERVAS_FILE);
+      const restantes = reservasAll.filter((r) => Number(r.id) !== id);
+      await writeJsonArrayFile(RESERVAS_FILE, restantes);
+    }
     return res.json({ ok: true, reserva: eliminada });
   } catch (error) {
     next(error);
@@ -531,24 +607,44 @@ app.post("/api/admin/bloqueos", requireAdmin, async (req, res, next) => {
     }
 
     const creadoEn = new Date().toISOString();
-    const insertResult = await dbRun(
-      `INSERT INTO bloqueos
-      (cancha, fecha, horario, horario_desde, horario_hasta, dia_completo, motivo, creado_en)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
+    let bloqueoId = Date.now();
+    if (USE_SQLITE) {
+      const insertResult = await dbRun(
+        `INSERT INTO bloqueos
+        (cancha, fecha, horario, horario_desde, horario_hasta, dia_completo, motivo, creado_en)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          cancha,
+          fecha,
+          nuevoBloqueo.horario,
+          nuevoBloqueo.horarioDesde,
+          nuevoBloqueo.horarioHasta,
+          diaCompleto ? 1 : 0,
+          motivo,
+          creadoEn,
+        ]
+      );
+      bloqueoId = insertResult.lastID;
+    } else {
+      const bloqueosAll = await readJsonArrayFile(BLOQUEOS_FILE);
+      bloqueoId =
+        bloqueosAll.reduce((max, b) => Math.max(max, Number(b.id) || 0), 0) + 1;
+      bloqueosAll.push({
+        id: bloqueoId,
         cancha,
         fecha,
-        nuevoBloqueo.horario,
-        nuevoBloqueo.horarioDesde,
-        nuevoBloqueo.horarioHasta,
-        diaCompleto ? 1 : 0,
+        horario: nuevoBloqueo.horario,
+        horarioDesde: nuevoBloqueo.horarioDesde,
+        horarioHasta: nuevoBloqueo.horarioHasta,
+        diaCompleto,
         motivo,
         creadoEn,
-      ]
-    );
+      });
+      await writeJsonArrayFile(BLOQUEOS_FILE, bloqueosAll);
+    }
 
     const bloqueo = {
-      id: insertResult.lastID,
+      id: bloqueoId,
       cancha,
       fecha,
       horario: nuevoBloqueo.horario,
@@ -572,7 +668,13 @@ app.delete("/api/admin/bloqueos/:id", requireAdmin, async (req, res, next) => {
     if (!eliminado) {
       return res.status(404).json({ error: "Bloqueo no encontrado." });
     }
-    await dbRun("DELETE FROM bloqueos WHERE id = ?", [id]);
+    if (USE_SQLITE) {
+      await dbRun("DELETE FROM bloqueos WHERE id = ?", [id]);
+    } else {
+      const bloqueosAll = await readJsonArrayFile(BLOQUEOS_FILE);
+      const restantes = bloqueosAll.filter((b) => Number(b.id) !== id);
+      await writeJsonArrayFile(BLOQUEOS_FILE, restantes);
+    }
     return res.json({ ok: true, bloqueo: eliminado });
   } catch (error) {
     next(error);
