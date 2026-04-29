@@ -1,0 +1,21 @@
+{
+  "name": "reservas-turno",
+  "version": "1.0.0",
+  "description": "Aplicacion web simple para reservar turnos de canchas de futbol",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "keywords": [
+    "reservas",
+    "futbol",
+    "express"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Reservas de Canchas</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="min-h-screen bg-slate-100 text-slate-800">
+    <nav class="border-b border-zinc-800 bg-black shadow-md" aria-label="Principal">
+      <div class="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-3 md:px-6">
+        <a href="/" class="flex shrink-0 items-center" aria-label="Automóvil Club San Nicolás - Inicio">
+          <img
+            src="/logo-club.png"
+            width="56"
+            height="56"
+            alt="Automóvil Club San Nicolás"
+            class="h-12 w-12 rounded-full object-cover ring-1 ring-zinc-600 md:h-14 md:w-14"
+          />
+        </a>
+        <a
+          href="/admin.html"
+          class="rounded-lg bg-[#14532d] px-3 py-2 text-center text-sm font-semibold text-white shadow-sm transition hover:bg-[#0f3f22] md:px-5 md:text-base"
+        >
+          Entrar como administrador
+        </a>
+      </div>
+    </nav>
+
+    <main class="mx-auto max-w-5xl p-4 md:p-6">
+      <header class="mb-4">
+        <h1 class="text-2xl font-bold md:text-3xl">Reservas de Canchas de Futbol</h1>
+        <p class="text-slate-600">Selecciona cancha, fecha y horario para reservar tu turno.</p>
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button id="btnSolicitarCancelacion" class="rounded-lg bg-slate-600 px-4 py-2 font-semibold text-white hover:bg-slate-700" type="button">
+            Solicitar cancelacion
+          </button>
+        </div>
+      </header>
+
+      <section class="mb-4 grid grid-cols-1 gap-3 rounded-xl bg-white p-4 shadow-sm md:grid-cols-3 md:items-end">
+        <div class="flex flex-col gap-1">
+          <label class="font-medium" for="cancha">Cancha</label>
+          <select id="cancha" class="rounded-lg border border-slate-300 px-3 py-2">
+            <option value="1">Cancha 1</option>
+            <option value="2">Cancha 2</option>
+          </select>
+        </div>
+
+        <div class="flex flex-col gap-1">
+          <label class="font-medium" for="fecha">Fecha</label>
+          <input id="fecha" type="date" class="rounded-lg border border-slate-300 px-3 py-2" />
+        </div>
+
+        <button id="btnBuscar" class="rounded-lg bg-slate-600 px-4 py-2 font-semibold text-white hover:bg-slate-700" type="button">
+          Actualizar horarios
+        </button>
+      </section>
+
+      <section class="mb-4 rounded-xl bg-white p-4 shadow-sm">
+        <h2 class="text-xl font-semibold">Horarios disponibles</h2>
+        <p class="mt-2 flex flex-wrap items-center gap-4 text-sm text-slate-600">
+          <span><span class="mr-1 inline-block h-3 w-3 rounded-full bg-emerald-600"></span> Disponible</span>
+          <span><span class="mr-1 inline-block h-3 w-3 rounded-full bg-slate-400"></span> Ocupado</span>
+          <span><span class="mr-1 inline-block h-3 w-3 rounded-full bg-amber-500"></span> Bloqueado</span>
+        </p>
+        <div id="horarios" class="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-5"></div>
+      </section>
+    </main>
+
+    <div id="modal" class="hidden fixed inset-0 z-10 flex items-center justify-center bg-black/55 p-4" role="dialog" aria-modal="true">
+      <div class="relative w-full max-w-xl rounded-xl bg-white p-4 shadow-md">
+        <button id="btnCerrarModal" class="absolute right-3 top-3 text-lg font-bold text-slate-600" type="button" aria-label="Cerrar">
+          x
+        </button>
+        <h3 class="text-xl font-semibold">Completa tu reserva</h3>
+        <p id="reservaSeleccion" class="mt-1 font-semibold text-emerald-700"></p>
+
+        <form id="formReserva" enctype="multipart/form-data">
+          <div id="paso1" class="step">
+            <h4 class="mb-2 mt-3 font-semibold">Paso 1 - Datos personales</h4>
+            <div class="mb-2 flex flex-col gap-1">
+              <label class="font-medium" for="nombre">Nombre y apellido</label>
+              <input id="nombre" name="nombre" type="text" required class="rounded-lg border border-slate-300 px-3 py-2" />
+            </div>
+            <div class="mb-3 flex flex-col gap-1">
+              <label class="font-medium" for="telefono">Telefono</label>
+              <input id="telefono" name="telefono" type="tel" required class="rounded-lg border border-slate-300 px-3 py-2" />
+            </div>
+            <button id="btnPaso2" class="rounded-lg bg-emerald-700 px-4 py-2 font-semibold text-white hover:bg-emerald-800" type="button">Continuar</button>
+          </div>
+
+          <div id="paso2" class="step hidden">
+            <h4 class="mb-2 mt-3 font-semibold">Paso 2 - Transferencia y comprobante</h4>
+            <div class="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p><strong>Alias:</strong> <span id="aliasTransferencia"></span></p>
+              <p><strong>CBU:</strong> <span id="cbuTransferencia"></span></p>
+              <p><strong>Titular:</strong> <span id="titularTransferencia"></span></p>
+            </div>
+            <div class="mb-3 flex flex-col gap-1">
+              <label class="font-medium" for="comprobante">Comprobante (JPG, PNG, WEBP o PDF)</label>
+              <input id="comprobante" name="comprobante" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf" required class="rounded-lg border border-slate-300 px-3 py-2" />
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button id="btnVolverPaso1" class="rounded-lg bg-slate-600 px-4 py-2 font-semibold text-white hover:bg-slate-700" type="button">
+                Volver
+              </button>
+              <button id="btnReservar" class="rounded-lg bg-emerald-700 px-4 py-2 font-semibold text-white hover:bg-emerald-800" type="submit">Reservar</button>
+            </div>
+          </div>
+        </form>
+
+        <p id="mensaje" class="mt-3 min-h-5 font-semibold text-red-700"></p>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
