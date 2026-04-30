@@ -207,8 +207,15 @@ reservasList.addEventListener("click", async (event) => {
   );
   if (!confirmar) return;
   try {
-    await api(`/api/admin/reservas/${id}`, { method: "DELETE" });
+    const data = await api(`/api/admin/reservas/${id}`, { method: "DELETE" });
     setMessage(adminMessage, "Turno cancelado y liberado.", false);
+    const r = data.reserva;
+    const telefono = r.telefono.replace(/\D/g, "");
+    const fecha = formatFecha(r.fecha);
+    const mensaje = encodeURIComponent(
+      `Hola ${r.nombre}, te informamos que tu turno en Cancha ${r.cancha} el ${fecha} a las ${r.horario}hs fue cancelado por administración. Disculpá los inconvenientes.`
+    );
+    window.open(`https://wa.me/${telefono}?text=${mensaje}`, "_blank");
     await refreshAdminData();
   } catch (error) {
     setMessage(adminMessage, error.message || "No se pudo cancelar el turno.");

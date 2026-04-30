@@ -18,6 +18,18 @@ try {
 } catch (_error) {
   sqlite3 = null;
 }
+let supabase = null;
+try {
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
+    const { createClient } = require("@supabase/supabase-js");
+    supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY
+    );
+  }
+} catch (_error) {
+  supabase = null;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -40,7 +52,10 @@ const WHATSAPP_NUMERO =
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
 const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD;
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const USE_SUPABASE = Boolean(supabase);
+const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "comprobantes";
 const USE_KV =
+  !USE_SUPABASE &&
   Boolean(kv) &&
   Boolean(process.env.KV_REST_API_URL) &&
   Boolean(process.env.KV_REST_API_TOKEN);
@@ -54,7 +69,7 @@ if (!fsSync.existsSync(UPLOADS_DIR)) {
   fsSync.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-const USE_SQLITE = Boolean(sqlite3);
+const USE_SQLITE = !USE_SUPABASE && Boolean(sqlite3);
 const db = USE_SQLITE ? new sqlite3.Database(DB_FILE) : null;
 
 function dbRun(sql, params = []) {
@@ -115,16 +130,18 @@ async function initDb() {
 
 const dbReady = initDb();
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-  filename: (_req, file, cb) => {
-    const safeOriginalName = file.originalname
-      .replace(/[^\w.\-]/g, "_")
-      .toLowerCase();
-    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e6)}-${safeOriginalName}`;
-    cb(null, uniqueName);
-  },
-});
+const storage = USE_SUPABASE
+  ? multer.memoryStorage()
+  : multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+      filename: (_req, file, cb) => {
+        const safeOriginalName = file.originalname
+          .replace(/[^\w.\-]/g, "_")
+          .toLowerCase();
+        const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e6)}-${safeOriginalName}`;
+        cb(null, uniqueName);
+      },
+    });
 
 const upload = multer({
   storage,
@@ -259,6 +276,18 @@ async function writeKvArray(key, data) {
 }
 
 async function readReservas({ fecha = "", cancha = null } = {}) {
+  if (USE_SUPABASE) {
+    let query = supabase
+      .from("reservas")
+      .select("*")
+      .order("fecha", { ascending: true })
+      .order("horario", { ascending: true });
+    if (fecha) query = query.eq("fecha", fecha);
+    if (cancha) query = query.eq("cancha", Number(cancha));
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data.map(mapReservaRow);
+  }
   if (USE_KV) {
     const reservas = await readKvArray(KV_RESERVAS_KEY);
     return reservas.filter((r) => {
@@ -294,6 +323,17 @@ async function readReservas({ fecha = "", cancha = null } = {}) {
 }
 
 async function readBloqueos({ fecha = "", cancha = null } = {}) {
+  if (USE_SUPABASE) {
+    let query = supabase
+      .from("bloqueos")
+      .select("*")
+      .order("fecha", { ascending: true });
+    if (fecha) query = query.eq("fecha", fecha);
+    if (cancha) query = query.eq("cancha", Number(cancha));
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data.map(mapBloqueoRow);
+  }
   if (USE_KV) {
     const bloqueos = await readKvArray(KV_BLOQUEOS_KEY);
     return bloqueos
@@ -485,11 +525,46 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
     }
 
     const creadoEn = new Date().toISOString();
+    let comprobanteUrl;
+    let comprobanteArchivo;
+    let reservaId;
 
-    const comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-
-    let reservaId = Date.now();
-    if (USE_KV) {
+    if (USE_SUPABASE) {
+      const ext = path.extname(req.file.originalname).toLowerCase() || ".jpg";
+      const storagePath = `${Date.now()}-${Math.round(Math.random() * 1e6)}${ext}`;
+      const { error: uploadError } = await supabase.storage
+        .from(SUPABASE_BUCKET)
+        .upload(storagePath, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: false,
+        });
+      if (uploadError) throw new Error(uploadError.message);
+      const { data: urlData } = supabase.storage
+        .from(SUPABASE_BUCKET)
+        .getPublicUrl(storagePath);
+      comprobanteArchivo = storagePath;
+      comprobanteUrl = urlData.publicUrl;
+      const { data: insertData, error: insertError } = await supabase
+        .from("reservas")
+        .insert({
+          nombre,
+          telefono,
+          cancha,
+          fecha,
+          horario,
+          comprobante_nombre_original: req.file.originalname,
+          comprobante_archivo: storagePath,
+          comprobante_mimetype: req.file.mimetype,
+          comprobante_size: req.file.size,
+          creado_en: creadoEn,
+        })
+        .select()
+        .single();
+      if (insertError) throw new Error(insertError.message);
+      reservaId = insertData.id;
+    } else if (USE_KV) {
+      comprobanteArchivo = req.file.filename;
+      comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
       const reservasAll = await readKvArray(KV_RESERVAS_KEY);
       reservaId =
         reservasAll.reduce((max, r) => Math.max(max, Number(r.id) || 0), 0) + 1;
@@ -510,6 +585,8 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
       });
       await writeKvArray(KV_RESERVAS_KEY, reservasAll);
     } else if (USE_SQLITE) {
+      comprobanteArchivo = req.file.filename;
+      comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
       const insertResult = await dbRun(
         `INSERT INTO reservas
         (nombre, telefono, cancha, fecha, horario, comprobante_nombre_original, comprobante_archivo, comprobante_mimetype, comprobante_size, creado_en)
@@ -529,6 +606,8 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
       );
       reservaId = insertResult.lastID;
     } else {
+      comprobanteArchivo = req.file.filename;
+      comprobanteUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
       const reservasAll = await readJsonArrayFile(RESERVAS_FILE);
       reservaId =
         reservasAll.reduce((max, r) => Math.max(max, Number(r.id) || 0), 0) + 1;
@@ -559,7 +638,7 @@ app.post("/reservas", upload.single("comprobante"), async (req, res, next) => {
       horario,
       comprobante: {
         nombreOriginal: req.file.originalname,
-        archivo: req.file.filename,
+        archivo: comprobanteArchivo,
         mimetype: req.file.mimetype,
         size: req.file.size,
       },
@@ -580,7 +659,9 @@ app.get("/api/admin/reservas", requireAdmin, async (_req, res, next) => {
     const reservas = await readReservas();
     const reservasConLink = reservas.map((r) => ({
       ...r,
-      comprobanteUrl: `/uploads/${r.comprobante.archivo}`,
+      comprobanteUrl: USE_SUPABASE
+        ? supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(r.comprobante.archivo).data.publicUrl
+        : `/uploads/${r.comprobante.archivo}`,
     }));
     res.json(reservasConLink);
   } catch (error) {
@@ -596,7 +677,11 @@ app.delete("/api/admin/reservas/:id", requireAdmin, async (req, res, next) => {
     if (!eliminada) {
       return res.status(404).json({ error: "Reserva no encontrada." });
     }
-    if (USE_KV) {
+    if (USE_SUPABASE) {
+      await supabase.storage.from(SUPABASE_BUCKET).remove([eliminada.comprobante.archivo]);
+      const { error } = await supabase.from("reservas").delete().eq("id", id);
+      if (error) throw new Error(error.message);
+    } else if (USE_KV) {
       const reservasAll = await readKvArray(KV_RESERVAS_KEY);
       const restantes = reservasAll.filter((r) => Number(r.id) !== id);
       await writeKvArray(KV_RESERVAS_KEY, restantes);
@@ -670,8 +755,25 @@ app.post("/api/admin/bloqueos", requireAdmin, async (req, res, next) => {
     }
 
     const creadoEn = new Date().toISOString();
-    let bloqueoId = Date.now();
-    if (USE_KV) {
+    let bloqueoId;
+    if (USE_SUPABASE) {
+      const { data: insertData, error: insertError } = await supabase
+        .from("bloqueos")
+        .insert({
+          cancha,
+          fecha,
+          horario: nuevoBloqueo.horario,
+          horario_desde: nuevoBloqueo.horarioDesde,
+          horario_hasta: nuevoBloqueo.horarioHasta,
+          dia_completo: diaCompleto,
+          motivo,
+          creado_en: creadoEn,
+        })
+        .select()
+        .single();
+      if (insertError) throw new Error(insertError.message);
+      bloqueoId = insertData.id;
+    } else if (USE_KV) {
       const bloqueosAll = await readKvArray(KV_BLOQUEOS_KEY);
       bloqueoId =
         bloqueosAll.reduce((max, b) => Math.max(max, Number(b.id) || 0), 0) + 1;
@@ -747,7 +849,10 @@ app.delete("/api/admin/bloqueos/:id", requireAdmin, async (req, res, next) => {
     if (!eliminado) {
       return res.status(404).json({ error: "Bloqueo no encontrado." });
     }
-    if (USE_KV) {
+    if (USE_SUPABASE) {
+      const { error } = await supabase.from("bloqueos").delete().eq("id", id);
+      if (error) throw new Error(error.message);
+    } else if (USE_KV) {
       const bloqueosAll = await readKvArray(KV_BLOQUEOS_KEY);
       const restantes = bloqueosAll.filter((b) => Number(b.id) !== id);
       await writeKvArray(KV_BLOQUEOS_KEY, restantes);
