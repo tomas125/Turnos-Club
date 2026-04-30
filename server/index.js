@@ -1,8 +1,8 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const express = require("express");
 const multer = require("multer");
-const path = require("path");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const crypto = require("crypto");
