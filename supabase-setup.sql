@@ -26,6 +26,15 @@ create table if not exists bloqueos (
   creado_en text not null
 );
 
+-- Clave de administrador (hash scrypt; la app inserta la fila inicial si esta vacia)
+create table if not exists admin_credential (
+  id integer primary key check (id = 1),
+  password_salt text not null,
+  password_hash text not null,
+  actualizado_en text not null
+);
+
 -- RLS: deshabilitar (la app usa service key, acceso controlado desde el backend)
 alter table reservas disable row level security;
 alter table bloqueos disable row level security;
+alter table admin_credential disable row level security;

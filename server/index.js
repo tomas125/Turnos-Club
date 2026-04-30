@@ -50,8 +50,16 @@ const TRANSFER_TITULAR = process.env.TRANSFER_TITULAR || "Club CMR Futbol";
 const WHATSAPP_NUMERO =
   (process.env.WHATSAPP_NUMERO || "5491112345678").replace(/\D/g, "");
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
-const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD;
+const ADMIN_SESSION_SECRET =
+  process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD;
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const ADMIN_SCRYPT_KEYLEN = 64;
+const ADMIN_SCRYPT_OPTS = {
+  N: 16384,
+  r: 8,
+  p: 1,
+  maxmem: 64 * 1024 * 1024,
+};
 const USE_SUPABASE = Boolean(supabase);
 const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "comprobantes";
 const USE_KV =
@@ -126,9 +134,118 @@ async function initDb() {
       creado_en TEXT NOT NULL
     )
   `);
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS admin_credential (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      password_salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      actualizado_en TEXT NOT NULL
+    )
+  `);
+  const adminRows = await dbAll(
+    "SELECT id FROM admin_credential WHERE id = 1 LIMIT 1"
+  );
+  if (!adminRows.length) {
+    const { salt, hash } = hashAdminPassword(ADMIN_PASSWORD);
+    await dbRun(
+      `INSERT INTO admin_credential (id, password_salt, password_hash, actualizado_en)
+       VALUES (1, ?, ?, ?)`,
+      [salt, hash, new Date().toISOString()]
+    );
+  }
 }
 
-const dbReady = initDb();
+function hashAdminPassword(plain) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto
+    .scryptSync(plain, salt, ADMIN_SCRYPT_KEYLEN, ADMIN_SCRYPT_OPTS)
+    .toString("hex");
+  return { salt, hash };
+}
+
+function verifyAdminPasswordScrypt(plain, salt, hashHex) {
+  try {
+    const expected = Buffer.from(hashHex, "hex");
+    const actual = crypto.scryptSync(
+      plain,
+      salt,
+      expected.length,
+      ADMIN_SCRYPT_OPTS
+    );
+    return (
+      expected.length === actual.length &&
+      crypto.timingSafeEqual(expected, actual)
+    );
+  } catch (_err) {
+    return false;
+  }
+}
+
+async function ensureSupabaseAdminCredential() {
+  if (!USE_SUPABASE) return;
+  const { data: existing, error: readError } = await supabase
+    .from("admin_credential")
+    .select("id")
+    .eq("id", 1)
+    .maybeSingle();
+  if (readError) {
+    console.warn(
+      "[admin] No se pudo leer admin_credential (¿falta la tabla en Supabase?):",
+      readError.message
+    );
+    return;
+  }
+  if (existing) return;
+  const { salt, hash } = hashAdminPassword(ADMIN_PASSWORD);
+  const { error: insertError } = await supabase.from("admin_credential").insert({
+    id: 1,
+    password_salt: salt,
+    password_hash: hash,
+    actualizado_en: new Date().toISOString(),
+  });
+  if (insertError) {
+    console.warn(
+      "[admin] No se pudo crear fila admin_credential:",
+      insertError.message
+    );
+  }
+}
+
+async function verifyAdminPasswordAgainstStore(plain) {
+  if (USE_SQLITE) {
+    const rows = await dbAll(
+      "SELECT password_salt, password_hash FROM admin_credential WHERE id = 1 LIMIT 1"
+    );
+    if (!rows.length) return null;
+    return verifyAdminPasswordScrypt(
+      plain,
+      rows[0].password_salt,
+      rows[0].password_hash
+    );
+  }
+  if (USE_SUPABASE) {
+    const { data, error } = await supabase
+      .from("admin_credential")
+      .select("password_salt, password_hash")
+      .eq("id", 1)
+      .maybeSingle();
+    if (error) return null;
+    if (!data) return null;
+    return verifyAdminPasswordScrypt(
+      plain,
+      data.password_salt,
+      data.password_hash
+    );
+  }
+  return null;
+}
+
+async function initStorage() {
+  await initDb();
+  await ensureSupabaseAdminCredential();
+}
+
+const dbReady = initStorage();
 
 const storage = USE_SUPABASE
   ? multer.memoryStorage()
@@ -458,13 +575,23 @@ app.get("/api/config", (_req, res) => {
   });
 });
 
-app.post("/api/admin/login", (req, res) => {
-  const password = (req.body?.password || "").trim();
-  if (!password || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: "Clave de admin incorrecta." });
+app.post("/api/admin/login", async (req, res, next) => {
+  try {
+    const password = (req.body?.password || "").trim();
+    if (!password) {
+      return res.status(401).json({ error: "Clave de admin incorrecta." });
+    }
+    const fromDb = await verifyAdminPasswordAgainstStore(password);
+    const ok =
+      fromDb === null ? password === ADMIN_PASSWORD : fromDb;
+    if (!ok) {
+      return res.status(401).json({ error: "Clave de admin incorrecta." });
+    }
+    const token = createAdminSession();
+    return res.json({ token, expiresInMs: ADMIN_SESSION_TTL_MS });
+  } catch (error) {
+    return next(error);
   }
-  const token = createAdminSession();
-  return res.json({ token, expiresInMs: ADMIN_SESSION_TTL_MS });
 });
 
 app.get("/api/reservas", async (req, res, next) => {
