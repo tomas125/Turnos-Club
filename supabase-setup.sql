@@ -26,11 +26,13 @@ create table if not exists bloqueos (
   creado_en text not null
 );
 
--- Clave de administrador (hash scrypt; la app inserta la fila inicial si esta vacia)
+-- Clave de administrador (dos slots opcionales; hash scrypt)
 create table if not exists admin_credential (
   id integer primary key check (id = 1),
   password_salt text not null,
   password_hash text not null,
+  password_salt_b text,
+  password_hash_b text,
   actualizado_en text not null
 );
 

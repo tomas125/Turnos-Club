@@ -50,6 +50,8 @@ const TRANSFER_TITULAR = process.env.TRANSFER_TITULAR || "Club CMR Futbol";
 const WHATSAPP_NUMERO =
   (process.env.WHATSAPP_NUMERO || "5491112345678").replace(/\D/g, "");
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const ADMIN_PASSWORD_SECOND =
+  process.env.ADMIN_PASSWORD_SECOND || "lucas123";
 const ADMIN_SESSION_SECRET =
   process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD;
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -142,15 +144,31 @@ async function initDb() {
       actualizado_en TEXT NOT NULL
     )
   `);
+  const adminCols = await dbAll("PRAGMA table_info(admin_credential)");
+  const adminColNames = new Set(adminCols.map((c) => c.name));
+  if (!adminColNames.has("password_salt_b")) {
+    await dbRun("ALTER TABLE admin_credential ADD COLUMN password_salt_b TEXT");
+  }
+  if (!adminColNames.has("password_hash_b")) {
+    await dbRun("ALTER TABLE admin_credential ADD COLUMN password_hash_b TEXT");
+  }
   const adminRows = await dbAll(
-    "SELECT id FROM admin_credential WHERE id = 1 LIMIT 1"
+    "SELECT id, password_salt_b, password_hash_b FROM admin_credential WHERE id = 1 LIMIT 1"
   );
+  const now = new Date().toISOString();
   if (!adminRows.length) {
-    const { salt, hash } = hashAdminPassword(ADMIN_PASSWORD);
+    const h1 = hashAdminPassword(ADMIN_PASSWORD);
+    const h2 = hashAdminPassword(ADMIN_PASSWORD_SECOND);
     await dbRun(
-      `INSERT INTO admin_credential (id, password_salt, password_hash, actualizado_en)
-       VALUES (1, ?, ?, ?)`,
-      [salt, hash, new Date().toISOString()]
+      `INSERT INTO admin_credential (id, password_salt, password_hash, password_salt_b, password_hash_b, actualizado_en)
+       VALUES (1, ?, ?, ?, ?, ?)`,
+      [h1.salt, h1.hash, h2.salt, h2.hash, now]
+    );
+  } else if (!adminRows[0].password_salt_b || !adminRows[0].password_hash_b) {
+    const h2 = hashAdminPassword(ADMIN_PASSWORD_SECOND);
+    await dbRun(
+      `UPDATE admin_credential SET password_salt_b = ?, password_hash_b = ?, actualizado_en = ? WHERE id = 1`,
+      [h2.salt, h2.hash, now]
     );
   }
 }
@@ -181,61 +199,99 @@ function verifyAdminPasswordScrypt(plain, salt, hashHex) {
   }
 }
 
+function verifyAdminRowPasswords(plain, row) {
+  if (!row) return false;
+  if (
+    verifyAdminPasswordScrypt(plain, row.password_salt, row.password_hash)
+  ) {
+    return true;
+  }
+  if (
+    row.password_salt_b &&
+    row.password_hash_b &&
+    verifyAdminPasswordScrypt(
+      plain,
+      row.password_salt_b,
+      row.password_hash_b
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function ensureSupabaseAdminCredential() {
   if (!USE_SUPABASE) return;
   const { data: existing, error: readError } = await supabase
     .from("admin_credential")
-    .select("id")
+    .select("id, password_salt_b, password_hash_b")
     .eq("id", 1)
     .maybeSingle();
   if (readError) {
     console.warn(
-      "[admin] No se pudo leer admin_credential (¿falta la tabla en Supabase?):",
+      "[admin] No se pudo leer admin_credential (¿falta la tabla o columnas _b en Supabase?):",
       readError.message
     );
     return;
   }
-  if (existing) return;
-  const { salt, hash } = hashAdminPassword(ADMIN_PASSWORD);
-  const { error: insertError } = await supabase.from("admin_credential").insert({
-    id: 1,
-    password_salt: salt,
-    password_hash: hash,
-    actualizado_en: new Date().toISOString(),
-  });
-  if (insertError) {
-    console.warn(
-      "[admin] No se pudo crear fila admin_credential:",
-      insertError.message
-    );
+  const now = new Date().toISOString();
+  if (!existing) {
+    const h1 = hashAdminPassword(ADMIN_PASSWORD);
+    const h2 = hashAdminPassword(ADMIN_PASSWORD_SECOND);
+    const { error: insertError } = await supabase
+      .from("admin_credential")
+      .insert({
+        id: 1,
+        password_salt: h1.salt,
+        password_hash: h1.hash,
+        password_salt_b: h2.salt,
+        password_hash_b: h2.hash,
+        actualizado_en: now,
+      });
+    if (insertError) {
+      console.warn(
+        "[admin] No se pudo crear fila admin_credential:",
+        insertError.message
+      );
+    }
+    return;
+  }
+  if (!existing.password_salt_b || !existing.password_hash_b) {
+    const h2 = hashAdminPassword(ADMIN_PASSWORD_SECOND);
+    const { error: upError } = await supabase
+      .from("admin_credential")
+      .update({
+        password_salt_b: h2.salt,
+        password_hash_b: h2.hash,
+        actualizado_en: now,
+      })
+      .eq("id", 1);
+    if (upError) {
+      console.warn(
+        "[admin] No se pudo completar segunda clave admin_credential:",
+        upError.message
+      );
+    }
   }
 }
 
 async function verifyAdminPasswordAgainstStore(plain) {
   if (USE_SQLITE) {
     const rows = await dbAll(
-      "SELECT password_salt, password_hash FROM admin_credential WHERE id = 1 LIMIT 1"
+      "SELECT password_salt, password_hash, password_salt_b, password_hash_b FROM admin_credential WHERE id = 1 LIMIT 1"
     );
     if (!rows.length) return null;
-    return verifyAdminPasswordScrypt(
-      plain,
-      rows[0].password_salt,
-      rows[0].password_hash
-    );
+    return verifyAdminRowPasswords(plain, rows[0]);
   }
   if (USE_SUPABASE) {
     const { data, error } = await supabase
       .from("admin_credential")
-      .select("password_salt, password_hash")
+      .select("password_salt, password_hash, password_salt_b, password_hash_b")
       .eq("id", 1)
       .maybeSingle();
     if (error) return null;
     if (!data) return null;
-    return verifyAdminPasswordScrypt(
-      plain,
-      data.password_salt,
-      data.password_hash
-    );
+    return verifyAdminRowPasswords(plain, data);
   }
   return null;
 }
@@ -583,7 +639,9 @@ app.post("/api/admin/login", async (req, res, next) => {
     }
     const fromDb = await verifyAdminPasswordAgainstStore(password);
     const ok =
-      fromDb === null ? password === ADMIN_PASSWORD : fromDb;
+      fromDb === null
+        ? password === ADMIN_PASSWORD || password === ADMIN_PASSWORD_SECOND
+        : fromDb;
     if (!ok) {
       return res.status(401).json({ error: "Clave de admin incorrecta." });
     }
